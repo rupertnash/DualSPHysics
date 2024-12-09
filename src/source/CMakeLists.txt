@@ -2,15 +2,119 @@
 # DualSPHysics GPU/CPU v5.2.245 12-09-2022
 #==================================================================
 
-cmake_minimum_required(VERSION 3.0)
+# 3.17 and 3.18 did a major update of CUDA support in CMake
+cmake_minimum_required(VERSION 3.18)
 
-PROJECT(DualSPHysics)
+project(DualSPHysics VERSION 5.2.245 LANGUAGES CXX)
 
+# Precompiled libraries for Linux+GCC and Windows+MSVC are distributed with the source
+# In these cases, default to using them.
+# Without these, using options below with `default_precompiled` will need you to set the
+set(default_precompiled_lib_dir NOTFOUND)
+if (CMAKE_SYSTEM_NAME STREQUAL Linux)
+  if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    set(default_precompiled_lib_dir ${CMAKE_CURRENT_SOURCE_DIR}/../lib/linux_gcc)
+  endif()
+elseif(CMAKE_SYSTEM_NAME STREQUAL Windows)
+  if (MSVC)
+    set(default_precompiled_lib_dir ${CMAKE_CURRENT_SOURCE_DIR}/../lib/vs2022)
+  endif()
+endif()
+
+set(PRECOMPILED_LIB_DIR "${default_precompiled_lib_dir}"
+  CACHE FILEPATH "Directory for precompiled dependencies")
+
+if (PRECOMPILED_LIB_DIR)
+  # By default enable the precompiled libraries
+  set(default_precompiled ON)
+else()
+  # By default disable the precompiled libraries
+  set(default_precompiled OFF)
+endif()
+
+option(ENABLE_CUDA "Enable CUDA version" ON)
 #------------------------------------------------------------------
 # Coupling options
 #------------------------------------------------------------------
-option(ENABLE_MOORDYN "Enable the MoorDyn+ library" ON)
-option(ENABLE_CHRONO "Enable the Chrono Engine library" ON)
+option(ENABLE_MOORDYN "Enable the MoorDyn+ library" ${default_precompiled})
+option(ENABLE_CHRONO "Enable the Chrono Engine library" ${default_precompiled})
+option(ENABLE_VTKLIB "Enable precompiled VTK wrapper" ${default_precompiled})
+option(ENABLE_WAVEGEN "Enable precompiled wave generation" ${default_precompiled})
+option(ENABLE_NUMEXLIB "Enable precompiled numexlib" ${default_precompiled})
+
+set(CMAKE_CXX_STANDARD 11)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
+if (ENABLE_CUDA)
+  enable_language(CUDA)
+endif()
+
+# Build the list of libraries
+set(active_libraries "")
+
+# Automate creating interface libraries for the dependencies.
+# Signature:
+# make_precompiled_lib(NAME <libname>
+#                      GNU <list of libraries for Gnu>
+#                      MSVC <list of libraries for MSVC>
+# )
+# Assumes an option of ENABLE_<LIBNAME> exists above
+# and that the flag to disable in the code is DISABLE_<LIBNAME>
+#
+# If the option is enabled then create an interface library that actually links it.
+# If it's disabled the interface library will simply define the disable macro.
+macro(make_precompiled_lib)
+  cmake_parse_arguments(_MPL "" "NAME" "GNU;MSVC" ${ARGN})
+
+  set(_mpl_flagname "ENABLE_${_MPL_NAME}")
+  string(TOUPPER "${_mpl_flagname}" _mpl_flagname)
+  set(_mpl_disable_def "DISABLE_${_MPL_NAME}")
+  string(TOUPPER "${_mpl_disable_def}" _mpl_disable_def)
+
+  add_library(${_MPL_NAME} INTERFACE)
+  if (${_mpl_flagname})
+    target_link_directories(${_MPL_NAME} INTERFACE "${PRECOMPILED_LIB_DIR}")
+    if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+      target_link_libraries(${_MPL_NAME} INTERFACE "${_MPL_GNU}")
+    elseif(MSVC)
+      target_link_libraries(${_MPL_NAME} "${_MPL_MSVC}")
+    endif()
+  else()
+    target_compile_definitions(${_MPL_NAME} INTERFACE ${_mpl_disable_def})
+  endif()
+  list(APPEND active_libraries ${_MPL_NAME})
+endmacro()
+
+# Apply above
+make_precompiled_lib(NAME vtklib
+  GNU jvtklib_64
+  MSVC LibJVtkLib_x64_v143_Release
+)
+make_precompiled_lib(NAME moordyn
+  GNU dsphmoordyn_64
+  MSVC LibDSphMoorDyn_x64_v143_Release
+)
+make_precompiled_lib(NAME chrono
+  GNU ChronoEngine dsphchrono
+  MSVC dsphchrono
+)
+make_precompiled_lib(NAME numexlib
+  GNU jnumexlib_64
+  MSVC LibJNumexLib_x64_v143_Release
+)
+
+# Seems that wavegen requires numexlib
+if (ENABLE_WAVEGEN AND NOT ENABLE_NUMEXLIB)
+  message(FATAL_ERROR "wavegen requires numexlib!")
+endif()
+make_precompiled_lib(NAME wavegen
+  GNU jwavegen_64
+  MSVC LibJWaveGen_x64_v143_Release
+)
+if (ENABLE_WAVEGEN AND ENABLE_NUMEXLIB)
+  target_link_libraries(wavegen INTERFACE numexlib)
+endif()
 
 #------------------------------------------------------------------
 # Source files
@@ -42,9 +146,7 @@ set(OBMDBC JPartNormalData.cpp)
 #------------------------------------------------------------------
 # NVCC Flags
 #------------------------------------------------------------------
-find_package(CUDA QUIET)
-
-if(CUDA_FOUND)
+if(ENABLE_CUDA)
   if(CUDA_VERSION VERSION_LESS "7.5")
     message("Using cuda version <7.5")
     list(APPEND CUDA_NVCC_FLAGS "-use_fast_math -O3 -gencode=arch=compute_20,code=\"sm_20,compute_20\"")
@@ -63,29 +165,21 @@ else()
   message("CUDA Libraries were not found.")
 endif()
 
-#------------------------------------------------------------------
-# Static libraries linker path
-#------------------------------------------------------------------
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
   set(PLATFORM "linux")
-  message("Using libraries for gcc")
-  LINK_DIRECTORIES(${CMAKE_CURRENT_SOURCE_DIR}/../lib/linux_gcc)
+  set(plat_suffix linux64)
 elseif(MSVC)
   message("Windows version")
   set(PLATFORM "windows")
-  #if(MSVC_VERSION VERSION_EQUAL 1900)
-    LINK_DIRECTORIES(${CMAKE_CURRENT_SOURCE_DIR}/../lib/vs2022)
-  #endif()
+  set(plat_suffix win64)
 endif()
 
 #--------------------------------------------
-# OpenMP flags
+# OpenMP, if available
 #---------------------------------------------
 find_package(OpenMP)
-
-if (OPENMP_FOUND)
-  set (CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${OpenMP_C_FLAGS}")
-  set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${OpenMP_CXX_FLAGS}")
+if (OpenMP_FOUND)
+  list(APPEND active_libraries OpenMP::OpenMP_CXX)
 endif()
 
 #------------------------------------------------------------------
@@ -95,20 +189,20 @@ set (CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/../../bin/${PLAT
 set (CMAKE_RUNTIME_OUTPUT_DIRECTORY_RELEASE ${CMAKE_RUNTIME_OUTPUT_DIRECTORY})         # Release output directory
 set (CMAKE_RUNTIME_OUTPUT_DIRECTORY_DEBUG ${CMAKE_RUNTIME_OUTPUT_DIRECTORY})           # Debug output directory
 
-if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-  add_executable(DualSPHysics5.2CPU_linux64 ${OBJXML} ${OBJSPHMOTION} ${OBCOMMON} ${OBCOMMONDSPH} ${OBSPH} ${OBSPHSINGLE} ${OBWAVERZ} ${OBCHRONO} ${OBMOORDYN} ${OBINOUT} ${OBMDBC})
-  install(TARGETS	DualSPHysics5.2CPU_linux64 DESTINATION ${CMAKE_RUNTIME_OUTPUT_DIRECTORY})
-  if (CUDA_FOUND)
-    cuda_add_executable(DualSPHysics5.2_linux64 ${OBJXML} ${OBJSPHMOTION} ${OBCOMMON} ${OBCOMMONDSPH} ${OBSPH} ${OBSPHSINGLE} ${OBCOMMONGPU} ${OBSPHGPU} ${OBSPHSINGLEGPU} ${OBCUDA} ${OBWAVERZ} ${OBWAVERZCUDA} ${OBCHRONO} ${OBMOORDYN} ${OBINOUT} ${OBINOUTGPU} ${OBMDBC})
-    install(TARGETS DualSPHysics5.2_linux64 DESTINATION ${CMAKE_RUNTIME_OUTPUT_DIRECTORY})
-  endif(CUDA_FOUND)
-elseif(MSVC) 
-  add_executable(DualSPHysics5.2CPU_win64 ${OBJXML} ${OBJSPHMOTION} ${OBCOMMON} ${OBCOMMONDSPH} ${OBSPH} ${OBSPHSINGLE} ${OBWAVERZ} ${OBCHRONO} ${OBMOORDYN} ${OBINOUT} ${OBMDBC})
-  install(TARGETS	DualSPHysics5.2CPU_win64 DESTINATION ${CMAKE_RUNTIME_OUTPUT_DIRECTORY})
-  if (CUDA_FOUND)
-    cuda_add_executable(DualSPHysics5.2_win64 ${OBJXML} ${OBJSPHMOTION} ${OBCOMMON} ${OBCOMMONDSPH} ${OBSPH} ${OBSPHSINGLE} ${OBCOMMONGPU} ${OBSPHGPU} ${OBSPHSINGLEGPU} ${OBCUDA} ${OBWAVERZ} ${OBWAVERZCUDA} ${OBCHRONO} ${OBMOORDYN} ${OBINOUT} ${OBINOUTGPU} ${OBMDBC})
-    install(TARGETS DualSPHysics5.2_win64 DESTINATION ${CMAKE_RUNTIME_OUTPUT_DIRECTORY})
-  endif(CUDA_FOUND)
+# Create vars for the CPU and GPU executables
+set(version "${PROJECT_VERSION_MAJOR}.${PROJECT_VERSION_MINOR}")
+set(cpu_exe "DualSPHysics${version}CPU_${plat_suffix}")
+set(gpu_exe "DualSPHysics${version}_${plat_suffix}")
+
+add_executable(${cpu_exe} ${OBJXML} ${OBJSPHMOTION} ${OBCOMMON} ${OBCOMMONDSPH} ${OBSPH} ${OBSPHSINGLE} ${OBWAVERZ} ${OBCHRONO} ${OBMOORDYN} ${OBINOUT} ${OBMDBC})
+target_link_libraries(${cpu_exe} PUBLIC ${active_libraries})
+install(TARGETS	${cpu_exe} DESTINATION ${CMAKE_RUNTIME_OUTPUT_DIRECTORY})
+
+if (ENABLE_CUDA)
+  cuda_add_executable(${gpu_exe} ${OBJXML} ${OBJSPHMOTION} ${OBCOMMON} ${OBCOMMONDSPH} ${OBSPH} ${OBSPHSINGLE} ${OBCOMMONGPU} ${OBSPHGPU} ${OBSPHSINGLEGPU} ${OBCUDA} ${OBWAVERZ} ${OBWAVERZCUDA} ${OBCHRONO} ${OBMOORDYN} ${OBINOUT} ${OBINOUTGPU} ${OBMDBC})
+  target_compile_definitions(${gpu_exe} PUBLIC _WITHGPU)
+  target_link_libraries(${gpu_exe} ${active_libraries})
+  install(TARGETS ${gpu_exe} DESTINATION ${CMAKE_RUNTIME_OUTPUT_DIRECTORY})
 endif()
 
 foreach(OUTPUTCONFIG ${CMAKE_CONFIGURATION_TYPES} )
@@ -116,65 +210,17 @@ foreach(OUTPUTCONFIG ${CMAKE_CONFIGURATION_TYPES} )
   set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_${OUTPUTCONFIG} ${CMAKE_RUNTIME_OUTPUT_DIRECTORY} )
 endforeach(OUTPUTCONFIG CMAKE_CONFIGURATION_TYPES )
 
-#------------------------------------------------------------------
-# General linker flags
-#------------------------------------------------------------------
-set(LINKER_FLAGS "")
-if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-  set(LINKER_FLAGS ${LINKER_FLAGS} jvtklib_64 jwavegen_64 jnumexlib_64)
-elseif(MSVC) 
-  set(LINKER_FLAGS ${LINKER_FLAGS} LibJVtkLib_x64_v143_Release LibJWaveGen_x64_v143_Release LibJNumexLib_x64_v143_Release)
-endif()
-
-#------------------------------------------------------------------
-# Coupled libraries
-#------------------------------------------------------------------
-# MoorDyn+
-if(ENABLE_MOORDYN)
-  message(STATUS "Using MoorDyn+")
-  if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-    set(LINKER_FLAGS ${LINKER_FLAGS} dsphmoordyn_64)
-  elseif(MSVC) 
-    set(LINKER_FLAGS ${LINKER_FLAGS} LibDSphMoorDyn_x64_v143_Release)
-  endif()
-else()
-  set (CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -DDISABLE_MOORDYN")
-  set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DDISABLE_MOORDYN")
-endif(ENABLE_MOORDYN)
-
-# Chrono Engine
-if(ENABLE_CHRONO)
-  message(STATUS "Using ChronoEngine Module")
-  if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-    set(LINKER_FLAGS ${LINKER_FLAGS} ChronoEngine dsphchrono)
-  elseif(MSVC) 
-    set(LINKER_FLAGS ${LINKER_FLAGS} dsphchrono)
-  endif()
-else()
-  set (CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -DDISABLE_CHRONO")
-  set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DDISABLE_CHRONO")
-endif(ENABLE_CHRONO)
 
 #------------------------------------------------------------------
 # Linker flags
 #------------------------------------------------------------------
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-  target_link_libraries(DualSPHysics5.2CPU_linux64 ${LINKER_FLAGS})
-  set_target_properties(DualSPHysics5.2CPU_linux64 PROPERTIES COMPILE_FLAGS "-use_fast_math -O3 -fPIC -std=c++0x")
   
   if (CUDA_FOUND)
-    target_link_libraries(DualSPHysics5.2_linux64 ${LINKER_FLAGS})
-    set_target_properties(DualSPHysics5.2_linux64 PROPERTIES COMPILE_FLAGS "-use_fast_math -O3 -D_WITHGPU -fPIC -std=c++0x -Wno-deprecated-gpu-targets")
+    set_target_properties(DualSPHysics5.2_linux64 PROPERTIES COMPILE_FLAGS "-use_fast_math -O3 -fPIC -std=c++0x -Wno-deprecated-gpu-targets")
   endif(CUDA_FOUND)
   
 elseif(MSVC)
-  set_target_properties(DualSPHysics5.2_win64 PROPERTIES COMPILE_FLAGS "/D _WITHGPU")
-
-  #if(MSVC_VERSION VERSION_EQUAL 1900)
-    # MSVC 2022
-    target_link_libraries(DualSPHysics5.2CPU_win64  ${LINKER_FLAGS})
-    target_link_libraries(DualSPHysics5.2_win64 ${LINKER_FLAGS})
-  #endif()
   
   SET(CUDA_PROPAGATE_HOST_FLAGS OFF CACHE BOOL "Propagate C/CXX Flags and friends to the host compiler in NVCC via -Xompile  " FORCE)
   

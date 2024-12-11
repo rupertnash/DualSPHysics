@@ -46,8 +46,73 @@ set(CMAKE_CXX_STANDARD 11)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+  set(CMAKE_CXX_FLAGS_RELEASE "-use_fast_math -O3 -DNDEBUG")
+endif()
+set(CMAKE_CUDA_FLAGS_RELEASE "-use_fast_math -O3 -DNDEBUG")
+
+function(get_supported_arch outvar)
+  execute_process(
+    COMMAND ${CMAKE_CUDA_COMPILER} --list-gpu-arch
+    RESULT_VARIABLE result
+    OUTPUT_VARIABLE arch_out
+  )
+
+  if (${result} EQUAL 0)
+    # OK, can use compiler's list
+    string(REPLACE "compute_" "" arch_out ${arch_out})
+    string(REPLACE "\n" ";" arch_out ${arch_out})
+    set(${outvar} "${arch_out}" PARENT_SCOPE)
+  else()
+    # Have to guess based on version
+    if (CUDAToolkit_VERSION VERSION_LESS 9)
+      set(arch "20;30;32;35;50;52;53")
+    elseif (CUDAToolkit_VERSION VERSION_LESS 10)
+      set(arch "30;32;35;50;52;53;60;61;62;70")
+    elseif (CUDAToolkit_VERSION VERSION_LESS 11)
+      set(arch "30;32;35;50;52;53;60;61;62;70;72;75")
+    elseif (CUDAToolkit_VERSION VERSION_LESS 12)
+      set(arch "30;32;35;50;52;53;60;61;62;70;72;75;80")
+    else()
+      set(arch "50;52;53;60;61;62;70;72;75;80;86;87;89;90")
+    endif()
+    set(${outvar} "${arch}" PARENT_SCOPE)
+  endif()
+endfunction()
+
 if (ENABLE_CUDA)
+  # First, figure out if arch has been set already, only do the guessing if not
+  # Override this by setting CMAKE_CUDA_ARCHITECTURES or env{CUDAARCHS}
+  if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+    set(set_default_arch ON)
+  else()
+    # Make it appear in UI
+    set(CMAKE_CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}" CACHE STRING "CUDA architectures")
+  endif()
+
   enable_language(CUDA)
+  set(CMAKE_CUDA_STANDARD 11)
+  set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+  find_package(CUDAToolkit REQUIRED)
+
+  if (set_default_arch)
+    # No value for arch was specified by user. Enable all the wanted
+    # ones that this version of CUDA supports.
+    set(wanted_arch "20;30;35;37;50;52;61;70")
+    message("No CUDA_ARCHITECTURES specified: will attempt to guess which of the following are supported: ${wanted_arch}")
+    get_supported_arch(supported_arch)
+
+    set(default_arch "")
+    foreach(arch ${wanted_arch})
+      if (arch IN_LIST supported_arch)
+        list(APPEND default_arch ${arch})
+      endif()
+    endforeach()
+    # Enabling CUDA sets a default for this. Iff we didn't have a
+    # value set already, override the CMake default.
+    set(CMAKE_CUDA_ARCHITECTURES "${default_arch}" CACHE STRING "CUDA architectures" FORCE)
+  endif()
+
 endif()
 
 # Build the list of libraries
@@ -58,14 +123,18 @@ set(active_libraries "")
 # make_precompiled_lib(NAME <libname>
 #                      GNU <list of libraries for Gnu>
 #                      MSVC <list of libraries for MSVC>
+#                      DEPS <list of other optional libs this one depends on>
 # )
 # Assumes an option of ENABLE_<LIBNAME> exists above
 # and that the flag to disable in the code is DISABLE_<LIBNAME>
 #
+# Dependencies MUST already have been created AND be controlled by a similar flag
+#
 # If the option is enabled then create an interface library that actually links it.
+#
 # If it's disabled the interface library will simply define the disable macro.
 macro(make_precompiled_lib)
-  cmake_parse_arguments(_MPL "" "NAME" "GNU;MSVC" ${ARGN})
+  cmake_parse_arguments(_MPL "" "NAME" "GNU;MSVC;DEPS" ${ARGN})
 
   set(_mpl_flagname "ENABLE_${_MPL_NAME}")
   string(TOUPPER "${_mpl_flagname}" _mpl_flagname)
@@ -74,19 +143,28 @@ macro(make_precompiled_lib)
 
   add_library(${_MPL_NAME} INTERFACE)
   if (${_mpl_flagname})
+    foreach(_mpl_dep ${_MPL_DEPS})
+      set(_mpl_depflagname "ENABLE_${_mpl_dep}")
+      string(TOUPPER "${_mpl_depflagname}" _mpl_depflagname)
+      if (NOT ${_mpl_depflagname})
+	message(FATAL_ERROR "Option ${_MPL_NAME} requires option ${_mpl_depflagname} be enabled")
+      endif()
+    endforeach()
+
     target_link_directories(${_MPL_NAME} INTERFACE "${PRECOMPILED_LIB_DIR}")
     if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
       target_link_libraries(${_MPL_NAME} INTERFACE "${_MPL_GNU}")
     elseif(MSVC)
-      target_link_libraries(${_MPL_NAME} "${_MPL_MSVC}")
+      target_link_libraries(${_MPL_NAME} INTERFACE "${_MPL_MSVC}")
     endif()
+    target_link_libraries(${_MPL_NAME} INTERFACE ${_MPL_DEPS})
   else()
     target_compile_definitions(${_MPL_NAME} INTERFACE ${_mpl_disable_def})
   endif()
   list(APPEND active_libraries ${_MPL_NAME})
 endmacro()
 
-# Apply above
+# Apply above to the shipped libraries
 make_precompiled_lib(NAME vtklib
   GNU jvtklib_64
   MSVC LibJVtkLib_x64_v143_Release
@@ -94,6 +172,7 @@ make_precompiled_lib(NAME vtklib
 make_precompiled_lib(NAME moordyn
   GNU dsphmoordyn_64
   MSVC LibDSphMoorDyn_x64_v143_Release
+  DEPS vtklib
 )
 make_precompiled_lib(NAME chrono
   GNU ChronoEngine dsphchrono
@@ -103,18 +182,11 @@ make_precompiled_lib(NAME numexlib
   GNU jnumexlib_64
   MSVC LibJNumexLib_x64_v143_Release
 )
-
-# Seems that wavegen requires numexlib
-if (ENABLE_WAVEGEN AND NOT ENABLE_NUMEXLIB)
-  message(FATAL_ERROR "wavegen requires numexlib!")
-endif()
 make_precompiled_lib(NAME wavegen
   GNU jwavegen_64
   MSVC LibJWaveGen_x64_v143_Release
+  DEPS numexlib vtklib
 )
-if (ENABLE_WAVEGEN AND ENABLE_NUMEXLIB)
-  target_link_libraries(wavegen INTERFACE numexlib)
-endif()
 
 #------------------------------------------------------------------
 # Source files
@@ -146,24 +218,6 @@ set(OBMDBC JPartNormalData.cpp)
 #------------------------------------------------------------------
 # NVCC Flags
 #------------------------------------------------------------------
-if(ENABLE_CUDA)
-  if(CUDA_VERSION VERSION_LESS "7.5")
-    message("Using cuda version <7.5")
-    list(APPEND CUDA_NVCC_FLAGS "-use_fast_math -O3 -gencode=arch=compute_20,code=\"sm_20,compute_20\"")
-  elseif(CUDA_VERSION VERSION_GREATER "7.4" AND CUDA_VERSION VERSION_LESS "9.1")
-    message("Using cuda version >=7.5 and <9.1")
-    list(APPEND CUDA_NVCC_FLAGS "-use_fast_math -O3  -gencode=arch=compute_20,code=\"sm_20,compute_20\" -gencode=arch=compute_30,code=\"sm_30,compute_30\" -gencode=arch=compute_35,code=\"sm_35,compute_35\" -gencode=arch=compute_37,code=\"sm_37,compute_37\" -gencode=arch=compute_50,code=\"sm_50,compute_50\" -gencode=arch=compute_52,code=\"sm_52,compute_52\"")
-  elseif(CUDA_VERSION VERSION_GREATER "9.1" AND CUDA_VERSION VERSION_LESS "11.0")
-  message("Using cuda version >=9.1 and <11.0")
-    list(APPEND CUDA_NVCC_FLAGS "-use_fast_math -O3  -gencode=arch=compute_30,code=\"sm_30,compute_30\" -gencode=arch=compute_35,code=\"sm_35,compute_35\" -gencode=arch=compute_37,code=\"sm_37,compute_37\" -gencode=arch=compute_50,code=\"sm_50,compute_50\" -gencode=arch=compute_52,code=\"sm_52,compute_52\" -gencode=arch=compute_61,code=\"sm_61,compute_61\" -gencode=arch=compute_70,code=\"sm_70,compute_70\"")
-  else()
-    message("Using cuda version >=11.0")
-	list(APPEND CUDA_NVCC_FLAGS "-Wno-deprecated-gpu-targets") # disable warning for the deprecated sm_35 and sm_37
-    list(APPEND CUDA_NVCC_FLAGS "-use_fast_math -O3 -gencode=arch=compute_35,code=\"sm_35,compute_35\" -gencode=arch=compute_37,code=\"sm_37,compute_37\" -gencode=arch=compute_50,code=\"sm_50,compute_50\" -gencode=arch=compute_52,code=\"sm_52,compute_52\" -gencode=arch=compute_61,code=\"sm_61,compute_61\" -gencode=arch=compute_70,code=\"sm_70,compute_70\"")
-  endif()
-else()
-  message("CUDA Libraries were not found.")
-endif()
 
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
   set(PLATFORM "linux")
@@ -199,9 +253,10 @@ target_link_libraries(${cpu_exe} PUBLIC ${active_libraries})
 install(TARGETS	${cpu_exe} DESTINATION ${CMAKE_RUNTIME_OUTPUT_DIRECTORY})
 
 if (ENABLE_CUDA)
-  cuda_add_executable(${gpu_exe} ${OBJXML} ${OBJSPHMOTION} ${OBCOMMON} ${OBCOMMONDSPH} ${OBSPH} ${OBSPHSINGLE} ${OBCOMMONGPU} ${OBSPHGPU} ${OBSPHSINGLEGPU} ${OBCUDA} ${OBWAVERZ} ${OBWAVERZCUDA} ${OBCHRONO} ${OBMOORDYN} ${OBINOUT} ${OBINOUTGPU} ${OBMDBC})
+  add_executable(${gpu_exe} ${OBJXML} ${OBJSPHMOTION} ${OBCOMMON} ${OBCOMMONDSPH} ${OBSPH} ${OBSPHSINGLE} ${OBCOMMONGPU} ${OBSPHGPU} ${OBSPHSINGLEGPU} ${OBCUDA} ${OBWAVERZ} ${OBWAVERZCUDA} ${OBCHRONO} ${OBMOORDYN} ${OBINOUT} ${OBINOUTGPU} ${OBMDBC})
   target_compile_definitions(${gpu_exe} PUBLIC _WITHGPU)
-  target_link_libraries(${gpu_exe} ${active_libraries})
+  target_link_libraries(${gpu_exe} PUBLIC ${active_libraries})
+  target_link_libraries(${gpu_exe} PUBLIC CUDA::cudart)
   install(TARGETS ${gpu_exe} DESTINATION ${CMAKE_RUNTIME_OUTPUT_DIRECTORY})
 endif()
 
